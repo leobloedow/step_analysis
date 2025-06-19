@@ -52,8 +52,20 @@ STEP_TIMEOUT_SECONDS = 5.0
 
 video_ended = False
 
+frame_counter = 0
+
+# Additional buffers and parameters for adaptive thresholds in video mode
+distance_adaptive_buffer = deque(maxlen=30)
+velocity_adaptive_buffer = deque(maxlen=30)
+adaptive_window_size = 30
+k_distance = 1.5
+k_velocity = 1.5
+
 # --- Main Loop ---
 while cap.isOpened():
+    frame_counter += 1
+    print(f"[FRAME {frame_counter}] Time: {time.time():.2f}")
+
     if video_ended:
         print("Video ended. Press 'q' to quit.")
         while True:
@@ -123,67 +135,165 @@ while cap.isOpened():
             vertical_distance = abs(la_y - ra_y)
 
             # Adjusted thresholds
-            MIN_STEP_THRESHOLD_PIXELS_ADJ = 60  # base threshold for lateral foot distance
-            MIN_VERTICAL_MOVEMENT = 20          # minimal vertical difference to consider foot movement significant
-            VELOCITY_THRESHOLD = 0.5            # minimal positive velocity to consider feet moving apart
+            if choice == '1':
+                MIN_STEP_THRESHOLD_PIXELS_ADJ = 60  # base threshold for lateral foot distance
+                MIN_VERTICAL_MOVEMENT = 20          # minimal vertical difference to consider foot movement significant
+                VELOCITY_THRESHOLD = 0.5            # minimal positive velocity to consider feet moving apart
+            else:
+                # Adaptive threshold computation using median and MAD with clamping
+                distance_adaptive_buffer.append(smoothed_distance)
+                velocity_adaptive_buffer.append(velocity)
 
-            # Implement step state machine with smoothing, velocity and vertical checks
+                if len(distance_adaptive_buffer) >= adaptive_window_size:
+                    dist_median = np.median(distance_adaptive_buffer)
+                    dist_mad = np.median(np.abs(distance_adaptive_buffer - dist_median))
+                    vel_median = np.median(velocity_adaptive_buffer)
+                    vel_mad = np.median(np.abs(velocity_adaptive_buffer - vel_median))
 
-            if step_phase == "Searching":
-                if (smoothed_distance > MIN_STEP_THRESHOLD_PIXELS_ADJ and
-                    velocity > VELOCITY_THRESHOLD and
-                    vertical_distance > MIN_VERTICAL_MOVEMENT):
-                    frames_above_threshold += 1
-                    if frames_above_threshold >= CONFIRMATION_FRAMES:
-                        step_phase = "Increasing"
-                        step_start_time = time.time()
-                        max_dist_in_step = smoothed_distance
-                        frames_above_threshold = 0
+                    adaptive_dist_threshold = dist_median + k_distance * dist_mad
+                    adaptive_vel_threshold = vel_median + k_velocity * vel_mad
+
+                    # Clamp thresholds to max values to avoid runaway
+                    MAX_DIST_THRESHOLD = 100
+                    MAX_VEL_THRESHOLD = 10
+
+                    adaptive_dist_threshold = min(adaptive_dist_threshold, MAX_DIST_THRESHOLD)
+                    adaptive_vel_threshold = min(adaptive_vel_threshold, MAX_VEL_THRESHOLD)
+
+                    distance_thresh = adaptive_dist_threshold
+                    velocity_thresh = adaptive_vel_threshold
                 else:
+                    distance_thresh = 40
+                    velocity_thresh = 0.25
+
+                MIN_STEP_THRESHOLD_PIXELS_ADJ = distance_thresh
+                VELOCITY_THRESHOLD = velocity_thresh
+                MIN_VERTICAL_MOVEMENT = 7          # lowered from 10 to 7
+
+            if choice == '1':
+                # Original step detection code (unchanged except vertical_distance removed)
+                if step_phase == "Searching":
+                    if (smoothed_distance > MIN_STEP_THRESHOLD_PIXELS_ADJ and
+                        velocity > VELOCITY_THRESHOLD):
+                        frames_above_threshold += 1
+                        if frames_above_threshold >= CONFIRMATION_FRAMES:
+                            step_phase = "Increasing"
+                            step_start_time = time.time()
+                            max_dist_in_step = smoothed_distance
+                            frames_above_threshold = 0
+                    else:
+                        frames_above_threshold = 0
+
+                elif step_phase == "Increasing":
                     frames_above_threshold = 0
+                    if time.time() - step_start_time > STEP_TIMEOUT_SECONDS:
+                        print("USER STOPPED (Timeout)")
+                        print("[DEBUG] Timeout reached, resetting to Searching")
+                        step_phase = "Searching"
+                        continue
 
-            elif step_phase == "Increasing":
-                frames_above_threshold = 0
-                if time.time() - step_start_time > STEP_TIMEOUT_SECONDS:
-                    print("USER STOPPED (Timeout)")
-                    step_phase = "Searching"
-                    continue
+                    if smoothed_distance > max_dist_in_step:
+                        max_dist_in_step = smoothed_distance
+                    elif smoothed_distance < max_dist_in_step * PEAK_DROP_PERCENTAGE:
+                        step_count += 1
+                        duration = time.time() - step_start_time
+                        step_data = {
+                            "id": step_count,
+                            "length": max_dist_in_step,
+                            "duration": duration
+                        }
+                        last_steps.append(step_data)
+                        print(f"Step #{step_count} | Length: {max_dist_in_step:.0f}px | Duration: {duration:.2f}s")
+                        step_phase = "Cooldown"
+                        cooldown_start_time = time.time()
 
-                if smoothed_distance > max_dist_in_step:
-                    max_dist_in_step = smoothed_distance
-                elif smoothed_distance < max_dist_in_step * PEAK_DROP_PERCENTAGE:
-                    step_count += 1
-                    duration = time.time() - step_start_time
-                    step_data = {
-                        "id": step_count,
-                        "length": max_dist_in_step,
-                        "duration": duration
-                    }
-                    last_steps.append(step_data)
-                    print(f"Step #{step_count} | Length: {max_dist_in_step:.0f}px | Duration: {duration:.2f}s")
-                    step_phase = "Cooldown"
-                    cooldown_start_time = time.time()
+                elif step_phase == "Cooldown":
+                    COOLDOWN_TIME = 0.05
+                    if time.time() - cooldown_start_time > COOLDOWN_TIME:
+                        step_phase = "Searching"
 
-            elif step_phase == "Cooldown":
-                # Prevent double counting steps too quickly
-                COOLDOWN_TIME = 0.05  # seconds
-                if time.time() - cooldown_start_time > COOLDOWN_TIME:
-                    step_phase = "Searching"
+                elif step_phase == "Decreasing":
+                    if smoothed_distance < MIN_STEP_THRESHOLD_PIXELS_ADJ * 0.9:
+                        step_phase = "Searching"
+                        max_dist_in_step = 0
+            else:
+                # Debugging video mode step detection with prints and loosened parameters
+                CONFIRMATION_FRAMES_VIDEO = 1  # less frames to confirm for debug
+                MIN_STEP_INTERVAL = 0.15       # shorter debounce interval
 
-            elif step_phase == "Decreasing":
-                if smoothed_distance < MIN_STEP_THRESHOLD_PIXELS_ADJ * 0.9:
-                    step_phase = "Searching"
-                    max_dist_in_step = 0
+                if step_phase == "Searching":
+                    if (smoothed_distance > MIN_STEP_THRESHOLD_PIXELS_ADJ and
+                        velocity > VELOCITY_THRESHOLD):
+                        print(f"[DEBUG][SEARCHING] frames_above_threshold={frames_above_threshold + 1}, dist={smoothed_distance:.2f}, vel={velocity:.2f}, vert={vertical_distance}")
+                        frames_above_threshold += 1
+                        if frames_above_threshold >= CONFIRMATION_FRAMES_VIDEO:
+                            print("[DEBUG] Transition to Increasing")
+                            step_phase = "Increasing"
+                            step_start_time = time.time()
+                            max_dist_in_step = smoothed_distance
+                            frames_above_threshold = 0
+                    else:
+                        frames_above_threshold = 0
 
-    # ================================================================= #
-    # --- "LAST 15 STEPS" DISPLAY (remains the same) ---
-    # ================================================================= #
+                elif step_phase == "Increasing":
+                    frames_above_threshold = 0
+                    if time.time() - step_start_time > STEP_TIMEOUT_SECONDS:
+                        print("USER STOPPED (Timeout)")
+                        step_phase = "Searching"
+                        continue
+
+                    MAX_STEP_DURATION = 1.2  # seconds
+
+                    if time.time() - step_start_time > MAX_STEP_DURATION:
+                        print("[DEBUG] Max step duration reached, forcing step end")
+                        step_count += 1
+                        duration = time.time() - step_start_time
+                        step_data = {
+                            "id": step_count,
+                            "length": max_dist_in_step,
+                            "duration": duration
+                        }
+                        last_steps.append(step_data)
+                        print(f"[DEBUG] Step detected #{step_count} | Length: {max_dist_in_step:.0f}px | Duration: {duration:.2f}s")
+                        cooldown_start_time = time.time()
+                        step_phase = "Cooldown"
+                        continue
+
+                    if smoothed_distance > max_dist_in_step:
+                        max_dist_in_step = smoothed_distance
+                    elif smoothed_distance < max_dist_in_step * PEAK_DROP_PERCENTAGE:
+                        duration = time.time() - step_start_time
+                        if duration < 0.12:
+                            print(f"[DEBUG] Ignored step due to short duration: {duration:.2f}s (below 0.12s threshold)")
+                        else:
+                            step_count += 1
+                            step_data = {
+                                "id": step_count,
+                                "length": max_dist_in_step,
+                                "duration": duration
+                            }
+                            last_steps.append(step_data)
+                            print(f"[DEBUG] Step detected #{step_count} | Length: {max_dist_in_step:.0f}px | Duration: {duration:.2f}s")
+                            cooldown_start_time = time.time()
+                            step_phase = "Cooldown"
+
+                elif step_phase == "Cooldown":
+                    COOLDOWN_TIME = 0.15  # lowered cooldown to allow closer steps
+                    if time.time() - cooldown_start_time > COOLDOWN_TIME:
+                        print("[DEBUG] Cooldown ended, resetting to Searching")
+                        step_phase = "Searching"
+
+                elif step_phase == "Decreasing":
+                    if smoothed_distance < MIN_STEP_THRESHOLD_PIXELS_ADJ * 0.9:
+                        print("[DEBUG] Distance dropped, resetting to Searching")
+                        step_phase = "Searching"
+                        max_dist_in_step = 0
+
+    # --- Display last 15 steps ---
     font = cv2.FONT_HERSHEY_SIMPLEX
     panel_y = 10
     panel_height = frame.shape[0]
     panel_width = frame.shape[1]
-
-    overlay = frame.copy()
 
     cv2.putText(frame, f"Passos: {step_count}", (30, panel_y + 60), font, 1.8, (255, 255, 255), 4)
     cv2.line(frame, (20, panel_y + 85), (panel_width - 20, panel_y + 85), (255, 255, 255), 2)
@@ -202,7 +312,6 @@ while cap.isOpened():
     if cv2.waitKey(5) & 0xFF == ord('q'):
         break
 
-# --- Cleanup ---
 print("Exiting...")
 cap.release()
 cv2.destroyAllWindows()
