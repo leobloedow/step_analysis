@@ -5,6 +5,9 @@ import time
 import math
 from collections import deque
 
+step_markers = deque(maxlen=20)  # store recent step positions and timestamps for display
+STEP_MARKER_DISPLAY_TIME = 1.5   # seconds to show step marker on video
+
 # --- MediaPipe Initialization ---
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
@@ -61,6 +64,9 @@ adaptive_window_size = 30
 k_distance = 1.5
 k_velocity = 1.5
 
+# Initialize previous foot positions
+prev_la_x, prev_la_y, prev_ra_x, prev_ra_y = 0, 0, 0, 0
+
 # --- Main Loop ---
 while cap.isOpened():
     frame_counter += 1
@@ -89,6 +95,8 @@ while cap.isOpened():
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = pose.process(rgb_frame)
     frame.flags.writeable = True
+
+    la_x, la_y, ra_x, ra_y = None, None, None, None  # Initialize current foot positions for update at frame end
 
     if results.pose_landmarks:
         mp_drawing.draw_landmarks(
@@ -119,6 +127,9 @@ while cap.isOpened():
             ra_y = int(((right_ankle.y + right_foot_tip.y) / 2) * panel_height)
 
             cv2.line(frame, (la_x, la_y), (ra_x, ra_y), (0, 255, 255), 3)
+
+            mid_x = (la_x + ra_x) // 2
+            mid_y = (la_y + ra_y) // 2
 
             # Calculate lateral distance between feet
             current_distance = math.hypot(ra_x - la_x, ra_y - la_y)
@@ -204,6 +215,13 @@ while cap.isOpened():
                         }
                         last_steps.append(step_data)
                         print(f"Step #{step_count} | Length: {max_dist_in_step:.0f}px | Duration: {duration:.2f}s")
+                        # Determine which foot moved more
+                        left_foot_movement = abs(la_x - prev_la_x) + abs(la_y - prev_la_y)
+                        right_foot_movement = abs(ra_x - prev_ra_x) + abs(ra_y - prev_ra_y)
+                        if left_foot_movement > right_foot_movement:
+                            step_markers.append((la_x, la_y, time.time()))
+                        else:
+                            step_markers.append((ra_x, ra_y, time.time()))
                         step_phase = "Cooldown"
                         cooldown_start_time = time.time()
 
@@ -255,6 +273,13 @@ while cap.isOpened():
                         }
                         last_steps.append(step_data)
                         print(f"[DEBUG] Step detected #{step_count} | Length: {max_dist_in_step:.0f}px | Duration: {duration:.2f}s")
+                        # Determine which foot moved more
+                        left_foot_movement = abs(la_x - prev_la_x) + abs(la_y - prev_la_y)
+                        right_foot_movement = abs(ra_x - prev_ra_x) + abs(ra_y - prev_ra_y)
+                        if left_foot_movement > right_foot_movement:
+                            step_markers.append((la_x, la_y, time.time()))
+                        else:
+                            step_markers.append((ra_x, ra_y, time.time()))
                         cooldown_start_time = time.time()
                         step_phase = "Cooldown"
                         continue
@@ -274,6 +299,13 @@ while cap.isOpened():
                             }
                             last_steps.append(step_data)
                             print(f"[DEBUG] Step detected #{step_count} | Length: {max_dist_in_step:.0f}px | Duration: {duration:.2f}s")
+                            # Determine which foot moved more
+                            left_foot_movement = abs(la_x - prev_la_x) + abs(la_y - prev_la_y)
+                            right_foot_movement = abs(ra_x - prev_ra_x) + abs(ra_y - prev_ra_y)
+                            if left_foot_movement > right_foot_movement:
+                                step_markers.append((la_x, la_y, time.time()))
+                            else:
+                                step_markers.append((ra_x, ra_y, time.time()))
                             cooldown_start_time = time.time()
                             step_phase = "Cooldown"
 
@@ -288,6 +320,11 @@ while cap.isOpened():
                         print("[DEBUG] Distance dropped, resetting to Searching")
                         step_phase = "Searching"
                         max_dist_in_step = 0
+
+    # Draw recent step markers still within display time
+    current_time = time.time()
+    for (x, y, t) in step_markers:
+        cv2.circle(frame, (x, y), 15, (0, 255, 0), thickness=-1)  # green filled circle only
 
     # --- Display last 15 steps ---
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -308,6 +345,11 @@ while cap.isOpened():
         cv2.putText(frame, step_text, (50, y_pos), font, 1.2, (255, 0, 0), 3)
 
     cv2.imshow('Full Body Pose & Step Analysis', frame)
+
+    # Update previous foot positions at end of frame processing if current positions are valid
+    if la_x is not None and la_y is not None and ra_x is not None and ra_y is not None:
+        prev_la_x, prev_la_y = la_x, la_y
+        prev_ra_x, prev_ra_y = ra_x, ra_y
 
     if cv2.waitKey(5) & 0xFF == ord('q'):
         break
